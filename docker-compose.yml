@@ -1,0 +1,18 @@
+services:
+  ocr-processor:
+    build:
+      context: .
+      network: host
+      args:
+        BUILD_REV: ${BUILD_REV:-dev}
+        BUILD_DATE: ${BUILD_DATE:-}
+    environment:
+      PYTHONUNBUFFERED: 1
+      PYTHONIOENCODING: utf-8
+      DB_HOST: host.docker.internal
+      DB_PORT: 5432
+      DB_NAME: main
+      DB_USER: postgres
+      DB_PASS: root
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
