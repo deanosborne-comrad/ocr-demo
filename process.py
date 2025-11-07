@@ -1,142 +1,159 @@
+import argparse
+import io
 import json
-import re
 import logging
-import threading
-from typing import Dict, List, Any
-import ollama
+import os
+from pathlib import Path
+from typing import Iterable, List
 
-logger = logging.getLogger(__name__)
-llm_lock = threading.Lock()
+import cairosvg
+import numpy as np
+import psycopg2
+from dotenv import load_dotenv
+from pdf2image import convert_from_bytes
+from PIL import Image
 
-class LLMProcessor:
-    def __init__(self, model_name="medllama2"):
-        self.model_name = model_name
-        self._ensure_models_available()
-    
-    def _ensure_models_available(self):
+from ocr_module import OCRProcessor
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ocr-runner")
+
+
+def load_image(path: Path) -> np.ndarray:
+    image = Image.open(path).convert("RGB")
+    return np.array(image)
+
+
+def run_single_image(ocr: OCRProcessor, path: Path) -> dict:
+    image_np = load_image(path)
+    lines = run_ocr_on_array(ocr, image_np)
+    return {
+        "source": "file",
+        "file": str(path),
+        "pages": [{"page": 1, "lines": lines}],
+        "success": True,
+    }
+
+
+def run_ocr_on_array(ocr: OCRProcessor, image_np: np.ndarray) -> List[dict]:
+    results = ocr.process_image(image_np)
+    return [{"text": text, "score": score} for text, score in results]
+
+
+def connect_db():
+    required = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASS")
+    missing = [key for key in required if not os.getenv(key)]
+    if missing:
+        raise RuntimeError(f"Missing DB environment variables: {', '.join(missing)}")
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASS"),
+    )
+
+
+def fetch_blob(conn, blob_id: int):
+    with conn.cursor() as cur:
+        cur.execute("SELECT cb_file_path, cb_binary FROM case_blob WHERE cb_serial = %s", (blob_id,))
+        row = cur.fetchone()
+        if not row:
+            return None, None
+        return row[0], row[1]
+
+
+def binary_to_images(binary: bytes, filename: str) -> Iterable[np.ndarray]:
+    suffix = (Path(filename).suffix or "").lower()
+
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
+        image = Image.open(io.BytesIO(binary)).convert("RGB")
+        yield np.array(image)
+        return
+
+    if suffix == ".pdf":
+        pages = convert_from_bytes(binary, dpi=300)
+        for page in pages:
+            yield np.array(page.convert("RGB"))
+        return
+
+    if suffix == ".svg":
+        png_bytes = cairosvg.svg2png(bytestring=binary)
+        image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        yield np.array(image)
+        return
+
+    # Fallback: try to interpret as image
+    image = Image.open(io.BytesIO(binary)).convert("RGB")
+    yield np.array(image)
+
+
+def run_blob(ocr: OCRProcessor, conn, blob_id: int) -> dict:
+    filename, binary = fetch_blob(conn, blob_id)
+    if not binary:
+        return {"source": "blob", "blob_id": blob_id, "success": False, "error": "not_found"}
+
+    pages = []
+    for idx, image_np in enumerate(binary_to_images(binary, filename or f"blob_{blob_id}"), start=1):
+        lines = run_ocr_on_array(ocr, image_np)
+        pages.append({"page": idx, "lines": lines})
+
+    return {
+        "source": "blob",
+        "blob_id": blob_id,
+        "filename": filename,
+        "pages": pages,
+        "success": True,
+    }
+
+
+def main() -> None:
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Run olmOCR on local files or Postgres blobs.")
+    parser.add_argument("inputs", nargs="*", help="Image paths (PNG/JPG/PDF/SVG) to process.")
+    parser.add_argument("--blob-ids", nargs="*", type=int, help="case_blob IDs to process via Postgres.")
+    args = parser.parse_args()
+
+    if not args.inputs and not args.blob_ids:
+        parser.error("Provide at least one file path or --blob-ids.")
+
+    ocr = OCRProcessor()
+    conn = None
+    payload = []
+
+    for item in args.inputs:
+        path = Path(item)
+        if not path.exists():
+            logger.error("File not found: %s", path)
+            payload.append({"source": "file", "file": str(path), "success": False, "error": "file_not_found"})
+            continue
         try:
-            models = ollama.list()
-            available_models = [model['name'] for model in models['models']]
-            
-            if self.model_name not in available_models:
-                logger.info(f"Pulling {self.model_name} model...")
-                ollama.pull(self.model_name)
-                logger.info(f"Model {self.model_name} cached locally")
-            else:
-                logger.info(f"Model {self.model_name} already available locally")
-                
-        except Exception as e:
-            logger.error(f"Error setting up {self.model_name}: {e}")
-            try:
-                self.model_name = "llama3.2:3b"
-                ollama.pull(self.model_name)
-                logger.info(f"Fallback model {self.model_name} ready")
-            except Exception as e2:
-                logger.error(f"Failed to setup any model: {e2}")
-                raise
-    
-    def generate_response(self, system_prompt: str, user_prompt: str, temperature: float = 0.1, max_tokens: int = 500) -> str:
-        try:
-            with llm_lock:
-                response = ollama.generate(
-                    model=self.model_name,
-                    prompt=f"System: {system_prompt}\n\nUser: {user_prompt}",
-                    options={'temperature': temperature, 'num_predict': max_tokens}
-                )
-            
-            return response['response'].strip()
-            
-        except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            return ""
-    
-    def clean_ocr_text(self, ocr_results: List[tuple]) -> str:
-        if not ocr_results:
-            return ""
-        
-        raw_text = " ".join([text for text, _ in ocr_results])
-        
-        system_prompt = """You are a medical document OCR correction specialist. Fix OCR errors in medical text while preserving medical terminology and meaning. Common OCR errors include 'rn' -> 'm', 'cl' -> 'd', '6' -> 'G', 'li' -> 'h'. Return only the corrected text."""
+            payload.append(run_single_image(ocr, path))
+        except Exception as exc:  # pragma: no cover - runtime safety
+            logger.exception("Failed to process %s", path)
+            payload.append({"source": "file", "file": str(path), "success": False, "error": str(exc)})
 
-        user_prompt = f"Correct OCR errors in this medical text:\n\n{raw_text}\n\nCorrected text:"
-        
+    if args.blob_ids:
         try:
-            cleaned_text = self.generate_response(system_prompt, user_prompt, temperature=0.1, max_tokens=500)
-            logger.info(f"OCR text cleaned: {len(raw_text)} -> {len(cleaned_text)} chars")
-            return cleaned_text
-            
-        except Exception as e:
-            logger.error(f"Error cleaning OCR text: {e}")
-            return raw_text
-    
-    def extract_medical_structure(self, text: str) -> Dict[str, Any]:
-        if not text:
-            return {"error": "No text provided"}
-        
-        system_prompt = """You are a medical information extraction specialist. Extract structured information from medical documents and return valid JSON. Extract these fields if present: patient_name, patient_id, date_of_service, referring_physician, medications, symptoms, diagnosis, procedures, vital_signs, clinical_notes, recommendations. Return only valid JSON."""
+            conn = connect_db()
+        except Exception as exc:
+            logger.exception("Failed to connect to Postgres")
+            for blob_id in args.blob_ids:
+                payload.append({"source": "blob", "blob_id": blob_id, "success": False, "error": f"db_error: {exc}"})
+        else:
+            with conn:
+                for blob_id in args.blob_ids:
+                    try:
+                        payload.append(run_blob(ocr, conn, blob_id))
+                    except Exception as exc:
+                        logger.exception("Failed to process blob %s", blob_id)
+                        payload.append({"source": "blob", "blob_id": blob_id, "success": False, "error": str(exc)})
+        finally:
+            if conn:
+                conn.close()
 
-        user_prompt = f"Extract medical information from this text and return as JSON:\n\n{text}\n\nJSON:"
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
-        try:
-            response_text = self.generate_response(system_prompt, user_prompt, temperature=0.2, max_tokens=800)
-            
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            
-            if json_start != -1 and json_end > json_start:
-                json_text = response_text[json_start:json_end]
-                try:
-                    structured_data = json.loads(json_text)
-                    logger.info("Successfully extracted structured medical data")
-                    return structured_data
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON decode error: {e}")
-            
-            return {"raw_extraction": response_text}
-            
-        except Exception as e:
-            logger.error(f"Error extracting medical structure: {e}")
-            return {"error": str(e), "raw_text": text}
-    
-    def validate_medical_terms(self, text: str) -> Dict[str, Any]:
-        if not text:
-            return {"error": "No text provided"}
-        
-        system_prompt = """You are a medical terminology expert. Analyze medical text and identify expanded abbreviations, potential OCR errors, corrections suggested, and validated terms. Return JSON format."""
 
-        user_prompt = f"Analyze this medical text for terminology issues:\n\n{text}\n\nAnalysis (JSON):"
-        
-        try:
-            response_text = self.generate_response(system_prompt, user_prompt, temperature=0.1, max_tokens=600)
-            
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            
-            if json_start != -1 and json_end > json_start:
-                try:
-                    return json.loads(response_text[json_start:json_end])
-                except json.JSONDecodeError:
-                    pass
-            
-            return {"analysis": response_text}
-            
-        except Exception as e:
-            logger.error(f"Error validating medical terms: {e}")
-            return {"error": str(e)}
-    
-    def summarize_document(self, text: str) -> str:
-        if not text:
-            return "No content to summarize."
-        
-        system_prompt = """You are a medical documentation specialist. Create concise, professional summaries of medical documents focusing on key medical findings, patient condition, medications and treatments, follow-up requirements, and critical information for healthcare providers."""
-
-        user_prompt = f"Summarize this medical document:\n\n{text}\n\nSummary:"
-        
-        try:
-            summary = self.generate_response(system_prompt, user_prompt, temperature=0.3, max_tokens=400)
-            logger.info(f"Generated summary ({len(summary)} chars)")
-            return summary
-            
-        except Exception as e:
-            logger.error(f"Error generating summary: {e}")
-            return f"Summary generation failed: {str(e)}"
+if __name__ == "__main__":
+    main()

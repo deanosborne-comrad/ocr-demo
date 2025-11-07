@@ -1,297 +1,115 @@
-Excellent. Fetching the binary data directly from a PostgreSQL database is a much more robust and scalable approach than reading from a local file system.
-
-We will modify the solution to connect to your PostgreSQL database, query the case_blob table, retrieve the binary data from the cb_binary column, and then perform the OCR.
+# Local olmOCR Pipeline (Quantized)
 
-Database Schema Assumption
-
-For this solution to work, I'll make a small but important assumption about your case_blob table. To know how to process the binary data (as a PNG, PDF, etc.), the script needs some metadata. The best way to store this is in another column.
-
-I will assume your table looks something like this, with a primary key and a column to store the original filename or mime type:
-SQL
-
-CREATE TABLE case_blob (
-id SERIAL PRIMARY KEY, -- A unique identifier for the row
-cb_filename VARCHAR(255), -- The original filename, e.g., 'invoice.pdf' or 'photo.png'
-cb_binary BYTEA -- The binary data of the file
-);
+This repo turns your RTX 4050 laptop into a self-contained OCR workstation using **olmOCR**, AllenAI’s multimodal OCR model. There is **no downstream LLM** – once the image is processed the raw Markdown/plain text is returned directly from the model.
 
-The script will use the cb_filename column to determine the file type. If you store a MIME type (e.g., application/pdf) instead, the code can be easily adapted.
+## Highlights
 
-Step 1: Update requirements.txt
+- Uses `allenai/olmOCR-2-7B-1025-FP8`, which is already quantized to FP8 and runs comfortably on a 6 GB RTX 4050 when `gpu_memory_utilization ≤ 0.6`.
+- `ocr_module.OCRProcessor` talks to a local OpenAI-compatible endpoint (served via `vllm`). If you prefer a hosted provider (DeepInfra, Parasail, etc.) just change the `.env` values.
+- `process.py` is a tiny CLI: pass one or more image paths and it prints the extracted text. No LLM cleaning/summarisation phases are left in the codebase.
 
-We need to add a PostgreSQL driver. psycopg2-binary is the standard choice and is easy to install.
-
-requirements.txt
-Plaintext
-
-paddlepaddle
-paddleocr
-Pillow
-numpy
-pdf2image
-CairoSVG
-psycopg2-binary
-
-Step 2: Update The Python Script (ocr_processor.py)
-
-The script will now connect to the database using credentials provided via environment variables (a security best practice), fetch the blob, and then proceed with the same processing logic as before.
-
-ocr_processor.py (Updated Version)
-Python
-
-import sys
-import io
-import os
-import numpy as np
-from PIL import Image
-from paddleocr import PaddleOCR
-from pdf2image import convert_from_bytes
-import cairosvg
-import psycopg2 # NEW: For connecting to PostgreSQL
-
-# --- Initialize PaddleOCR ---
-
-# This is done once and reused.
-
-print("Initializing PaddleOCR...")
-ocr = PaddleOCR(use_angle_cls=True, lang="en")
-print("PaddleOCR Initialized.")
-
-# --- Database Connection ---
-
-# NEW: Fetch credentials from environment variables for security
-
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASS")
-
-def fetch_blob_from_db(blob_id):
-"""
-Connects to the database and fetches the binary data and filename for a given ID.
-"""
-conn = None
-try:
-if not all([DB_NAME, DB_USER, DB_PASS]):
-raise ValueError("Database credentials (DB_NAME, DB_USER, DB_PASS) must be set as environment variables.")
-
-        print(f"Connecting to database '{DB_NAME}' on {DB_HOST}:{DB_PORT}...")
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASS
-        )
-        cur = conn.cursor()
-
-        # Assumes your primary key is 'id' and filename column is 'cb_filename'
-        query = "SELECT cb_binary, cb_filename FROM case_blob WHERE id = %s"
-        cur.execute(query, (blob_id,))
-
-        record = cur.fetchone()
-
-        if record:
-            print(f"Record found for ID {blob_id}.")
-            binary_data, filename = record
-            # The data from BYTEA is returned as a memoryview or bytes object, which is perfect.
-            return binary_data, filename
-        else:
-            print(f"No record found for ID {blob_id}.")
-            return None, None
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return None, None
-    finally:
-        if conn:
-            conn.close()
-            print("Database connection closed.")
-
-# --- Processing Functions (No changes needed here) ---
-
-# process_image_binary, process_pdf_binary, process_svg_binary, print_ocr_results
-
-# remain exactly the same as in the previous answer.
-
-def process_image_binary(binary_data):
-try:
-image = Image.open(io.BytesIO(binary_data)).convert("RGB")
-image_np = np.array(image)
-return ocr.ocr(image_np, cls=True)
-except Exception as e:
-print(f"Error processing image binary: {e}")
-return None
-
-def process_pdf_binary(binary_data):
-try:
-images = convert_from_bytes(binary_data, dpi=300)
-all_results = []
-for i, page_image in enumerate(images):
-print(f"--- Processing PDF Page {i+1} ---")
-page_image_np = np.array(page_image)
-result = ocr.ocr(page_image_np, cls=True)
-all_results.append({"page": i + 1, "results": result})
-return all_results
-except Exception as e:
-print(f"Error processing PDF binary: {e}")
-return None
-
-def process_svg_binary(binary_data):
-try:
-png_binary = cairosvg.svg2png(bytestring=binary_data)
-return process_image_binary(png_binary)
-except Exception as e:
-print(f"Error processing SVG binary: {e}")
-return None
-
-def print_ocr_results(ocr_result):
-if not ocr_result:
-print("No results to print.")
-return
-if isinstance(ocr_result, list) and all(isinstance(item, dict) and 'page' in item for item in ocr_result):
-for page_result in ocr_result:
-print(f"\n============== Page {page_result['page']} ==============")
-for page_data in page_result['results']:
-for line in page_data:
-text = line[1][0]
-confidence = line[1][1]
-print(f"Text: '{text}', Confidence: {confidence:.4f}")
-else:
-for result_set in ocr_result:
-for line in result_set:
-text = line[1][0]
-confidence = line[1][1]
-print(f"Text: '{text}', Confidence: {confidence:.4f}")
-
-# --- Main execution block ---
-
-if **name** == "**main**":
-if len(sys.argv) < 2:
-print("Usage: python ocr_processor.py <case_blob_id>")
-sys.exit(1)
-
-    try:
-        target_id = int(sys.argv[1])
-    except ValueError:
-        print("Error: The provided ID must be an integer.")
-        sys.exit(1)
-
-    print(f"\nAttempting to fetch and process blob with ID: {target_id}")
-
-    # NEW: Fetch data from the database
-    binary_content, filename = fetch_blob_from_db(target_id)
-
-    if binary_content and filename:
-        results = None
-        # Determine file type from filename and process
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-            results = process_image_binary(binary_content)
-        elif filename.lower().endswith('.pdf'):
-            results = process_pdf_binary(binary_content)
-        elif filename.lower().endswith('.svg'):
-            results = process_svg_binary(binary_content)
-        else:
-            print(f"Unsupported file type for filename: {filename}")
-
-        if results:
-            print("\n--- OCR Results ---")
-            print_ocr_results(results)
-    else:
-        print("Could not retrieve data from database. Aborting.")
-
-Step 3: Dockerfile (No Changes)
-
-Your Dockerfile from the previous step is perfectly fine. It will now install psycopg2-binary along with the other dependencies when it runs pip install -r requirements.txt.
-
-Dockerfile (remains the same)
-Dockerfile
-
-FROM python:3.9-slim
-WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends \
- poppler-utils \
- libgl1-mesa-glx \
- libglib2.0-0 \
- && rm -rf /var/lib/apt/lists/\*
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY ocr_processor.py .
-ENTRYPOINT ["python", "ocr_processor.py"]
-
-Step 4: Build and Run with Database Connection
-
-The build process is the same, but the run command is different. We no longer need to mount a volume. Instead, we pass the database credentials and network configuration as parameters.
-
-    Build the Docker image (or rebuild it if you built it previously):
-    Bash
-
-docker build -t paddleocr-service-db .
-
-Run the container with Environment Variables:
-You now pass your database credentials using the -e flag and provide the ID of the blob you want to process.
-Bash
-
-    docker run --rm \
-      -e DB_HOST='your_db_host' \
-      -e DB_PORT='5432' \
-      -e DB_NAME='your_db_name' \
-      -e DB_USER='your_username' \
-      -e DB_PASS='your_password' \
-      paddleocr-service-db 123
-
-    (Replace 123 with the actual ID from your case_blob table).
-
-Important Note on Docker Networking
-
-How the container connects to your_db_host is critical:
-
-    If your PostgreSQL is also a Docker container: Put both containers on the same Docker network and use the PostgreSQL container's name as the DB_HOST.
-
-    If PostgreSQL is running on your host machine (the same machine running Docker):
-
-        On Docker Desktop (Windows/Mac), you can use the special DNS name host.docker.internal as the DB_HOST.
-
-        On Linux, the easiest way is to use host networking by adding --network="host" to the docker run command. In this case, DB_HOST would be localhost.
-
-Example for Docker Desktop (DB on host):
-Bash
-
-docker run --rm \
- -e DB_HOST='host.docker.internal' \
- -e DB_PORT='5432' \
- -e DB_NAME='your_db_name' \
- -e DB_USER='your_username' \
- -e DB_PASS='your_password' \
- paddleocr-service-db 123
-
-Step 5: Build and Run the Docker Container
-
-Now, let's put it all together.
-
-    Open your terminal and navigate to the ocr_service directory.
-
-    Build the Docker image. This will take some time, especially the first time, as it downloads the base image and all dependencies.
-    Bash
-
-docker build -t paddleocr-service .
-
-Run the container. We will use a volume (-v) to mount the test_files directory from your computer into the container at /app/test_files. This allows the script inside the container to access your local files.
-
-To process a PNG file:
-Bash
-
-docker run --rm -v "$(pwd)/test_files:/app/test_files" paddleocr-service ./test_files/my_image.png
-
-To process a PDF file:
-Bash
-
-docker run --rm -v "$(pwd)/test_files:/app/test_files" paddleocr-service ./test_files/my_document.pdf
-
-To process an SVG file:
-Bash
-
-    docker run --rm -v "$(pwd)/test_files:/app/test_files" paddleocr-service ./test_files/my_vector.svg
-
-When you run these commands, you will see output in your terminal as PaddleOCR initializes, processes the file, and finally prints the extracted text to the console.
+## Requirements
+
+| Component | Notes |
+| --- | --- |
+| Python 3.11+ | `olmocr` wheels target 3.11+ and include PyTorch 2.7. |
+| GPU | RTX 4050 laptop GPU (6 GB) works with FP8 quantization. Larger cards can raise `gpu_memory_utilization`. |
+| CUDA toolkit | Install NVIDIA drivers + CUDA 12.4 (or matching version for the `vllm` wheel you install). |
+| System packages | `poppler-utils`, `libgl1`, `libgomp1`, fonts – covered automatically in Docker. |
+| Hugging Face token | Required to download `allenai/olmOCR-2-7B-1025-FP8`. Set `HF_TOKEN` in `.env`. |
+
+## Setup
+
+```bash
+python -m venv .venv
+. .venv/bin/activate  # .\.venv\Scripts\activate on Windows
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### Launch the local vLLM server (quantized)
+
+```powershell
+pwsh scripts/start_local_olmocr.ps1
+# or the equivalent bash script if you create one
+```
+
+The script simply runs:
+
+```
+vllm serve allenai/olmOCR-2-7B-1025-FP8 \
+  --served-model-name olmocr \
+  --quantization fp8 \
+  --gpu-memory-utilization 0.6 \
+  --port 30024
+```
+
+Set `HF_TOKEN` in your environment (or `.env`) so vLLM can download the checkpoint. Once the server prints “The server is fired up and ready to roll!” you can point `OCRProcessor` at `http://localhost:30024/v1`.
+
+### Run OCR on local files
+
+```bash
+python process.py 01.png 02.png
+```
+
+Output example:
+
+```
+=== 01.png ===
+[1.00] PATIENT: John Smith
+[0.98] DOB: 07/12/1981
+...
+```
+
+The confidence value is just a placeholder (olmOCR does not expose per-line scores).
+
+### Process blobs from Postgres
+
+Set the database credentials in `.env` (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASS`). The `case_blob` table is expected to contain `cb_binary` (BYTEA) and `cb_filename` columns. Then call:
+
+```bash
+python process.py --blob-ids 1234 5678
+```
+
+Each blob entry in the JSON output includes the ID, filename, and per-page OCR results. PNG/JPG/SVG/PDF blobs are supported (PDFs are expanded into individual pages).
+
+## Environment variables
+
+`.env` ships with sensible defaults:
+
+```
+OLMOCR_SERVER_URL=http://127.0.0.1:30024/v1
+OLMOCR_MODEL=olmocr
+OLMOCR_GPU_MEMORY_UTILIZATION=0.6
+OLMOCR_TARGET_LONGEST_DIM=1280
+```
+
+If you use a hosted provider, update `OLMOCR_SERVER_URL`, `OLMOCR_MODEL`, and `OLMOCR_API_KEY`.
+
+For database usage, make sure `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASS` are filled in.
+
+## Docker
+
+Build & run (mount the model cache if you want re-use between runs):
+
+```bash
+docker build -t ocr-processor:latest .
+docker run --rm --gpus all \
+  --env-file .env \
+  -v ${PWD}/models:/root/.cache/huggingface \
+  ocr-processor:latest 01.png
+```
+
+Inside the container `python process.py` is executed. You still need a vLLM server reachable from the container (either host-port mapping or run the server in another container).
+
+## Troubleshooting
+
+- `HTTP 401/403` – `OLMOCR_API_KEY` or `HF_TOKEN` missing/invalid.
+- `CUDA out of memory` – lower `OLMOCR_GPU_MEMORY_UTILIZATION`, shrink `OLMOCR_TARGET_LONGEST_DIM`, or limit concurrent requests.
+- `finish_reason != stop` – the server restarted; `OCRProcessor` already retries with exponential backoff.
+- `vllm` wheel install fails on Windows – install via WSL2 Ubuntu, or run the official [`alleninstituteforai/olmocr`](https://hub.docker.com/r/alleninstituteforai/olmocr) Docker image with `--gpus all`.
+
+## Next steps
+
+- Wire `process.py` into your database loader so the binary blobs feed directly into `OCRProcessor`.
+- Tune the quantization / resolution knobs for your GPU (e.g., `--gpu-memory-utilization 0.7`, `OLMOCR_TARGET_LONGEST_DIM=1400` on 8 GB cards).

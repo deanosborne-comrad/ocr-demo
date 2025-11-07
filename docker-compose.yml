@@ -14,5 +14,9 @@ services:
       DB_NAME: main
       DB_USER: postgres
       DB_PASS: root
+      OLMOCR_SERVER_URL: ${OLMOCR_SERVER_URL:-http://host.docker.internal:30024/v1}
+      OLMOCR_MODEL: ${OLMOCR_MODEL:-olmocr}
+      OLMOCR_API_KEY: ${OLMOCR_API_KEY:-}
+      OLMOCR_TARGET_LONGEST_DIM: ${OLMOCR_TARGET_LONGEST_DIM:-1280}
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -1,172 +1,191 @@
-import os
+import base64
+import contextlib
+import io
 import logging
-import re
+import os
 import threading
-from typing import List, Tuple, Optional
+import time
+from typing import List, Sequence, Tuple
+
+import httpx
 import numpy as np
-import cv2
-from paddleocr import PaddleOCR
+from PIL import Image, ImageOps
+from olmocr.prompts import PageResponse, build_no_anchoring_v4_yaml_prompt
+from olmocr.train.dataloader import FrontMatterParser
 
 logger = logging.getLogger(__name__)
-
-NOISE_CHARS = frozenset('-.,;:\'"~_!@#$%^&*()[]{}<>?/\\|¿¡§¶†‡•‰€™')
 ocr_lock = threading.Lock()
 
+
+class TemporaryOcrError(Exception):
+    """Raised when the upstream olmOCR endpoint indicates a transient failure."""
+
+
 class OCRProcessor:
-    def __init__(self):
-        os.environ['OMP_NUM_THREADS'] = '1'
-        os.environ['MKL_NUM_THREADS'] = '1'
-        self.ocr = PaddleOCR(
-            lang='en',
-            det_db_thresh=0.1,
-            det_db_box_thresh=0.3,
-            det_db_unclip_ratio=2.5,
-            rec_batch_num=1,
-            max_text_length=100,
-            drop_score=0.2,
-            use_angle_cls=True,
-            use_space_char=True,
-            use_gpu=False,
-            show_log=False
+    """Thin client around the olmOCR OpenAI-compatible API."""
+
+    def __init__(
+        self,
+        server_url: str | None = None,
+        api_key: str | None = None,
+        model_name: str | None = None,
+        max_tokens: int = 8000,
+        max_retries: int = 4,
+        request_timeout: float = 90.0,
+        temperature_schedule: Sequence[float] | None = None,
+        target_longest_image_dim: int = 1400,
+    ) -> None:
+        self.server_url = (server_url or os.getenv("OLMOCR_SERVER_URL", "http://localhost:30024/v1")).rstrip("/")
+        self.api_key = api_key or os.getenv("OLMOCR_API_KEY")
+        self.model_name = model_name or os.getenv("OLMOCR_MODEL", "allenai/olmOCR-2-7B-1025-FP8")
+        self.max_tokens = max_tokens
+        self.max_retries = max_retries
+        self.temperature_schedule = tuple(temperature_schedule or (0.1, 0.2, 0.3, 0.5, 0.8))
+        self.target_longest_image_dim = max(256, int(target_longest_image_dim))
+        self._prompt = build_no_anchoring_v4_yaml_prompt()
+        self._parser = FrontMatterParser(front_matter_class=PageResponse)
+        timeout = httpx.Timeout(timeout=request_timeout)
+        self._client = httpx.Client(timeout=timeout)
+        logger.info(
+            "Initialized olmOCR client -> server=%s model=%s retries=%s",
+            self.server_url,
+            self.model_name,
+            self.max_retries,
         )
-    
-    def validate_kernel_size(self, size):
-        if size <= 0:
-            return 1
-        if size % 2 == 0:
-            return size + 1
-        return size
-    
-    def enhance_for_handwriting(self, image_np: np.ndarray) -> np.ndarray:
-        if len(image_np.shape) == 3:
-            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = image_np.copy()
-        
-        kernel_size = self.validate_kernel_size(3)
-        blurred = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
-        
-        adaptive_thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        cleaned = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_CLOSE, kernel)
-        
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 1))
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel_open)
-        
-        if len(image_np.shape) == 3:
-            return cv2.cvtColor(cleaned, cv2.COLOR_GRAY2RGB)
-        return cleaned
-    
-    def pad_to_multiple(self, img: np.ndarray, multiple: int = 32) -> np.ndarray:
-        h, w = img.shape[:2]
-        new_h = (h + multiple - 1) // multiple * multiple
-        new_w = (w + multiple - 1) // multiple * multiple
-        if new_h != h or new_w != w:
-            padded_img = np.zeros((new_h, new_w, 3), dtype=img.dtype)
-            padded_img[:h, :w, :] = img
-            return padded_img
-        return img
-    
-    def preprocess_image(self, image_np: np.ndarray) -> np.ndarray:
-        if len(image_np.shape) == 3:
-            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = image_np
-        
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        
-        img_rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
-        return self.pad_to_multiple(img_rgb, multiple=32)
-    
-    def normalize_text(self, text: str) -> Optional[str]:
-        if not text:
-            return None
-        
-        text = text.strip()
-        if not text:
-            return None
-        
-        text = re.sub(r'[^\w\s\-.,;:\'"~!@#$%^&*()[\]{}<>?/\\|¿¡§¶†‡•‰€™]', '', text)
-        text = text.strip()
-        
-        if len(text) == 1 and text in NOISE_CHARS:
-            return None
-        
-        if len(text) >= 1 and (text.isalnum() or len(text) >= 2):
-            return text
-        
-        return None
-    
-    def safe_ocr_process(self, image_np: np.ndarray, strategy_name: str) -> List[Tuple[str, float]]:
-        try:
-            with ocr_lock:
-                raw_result = self.ocr.ocr(image_np, cls=True)
-            
-            if raw_result and raw_result[0]:
-                results = []
-                for line in raw_result[0]:
-                    if not (isinstance(line, list) and len(line) == 2):
-                        continue
-                    text_info = line[1]
-                    if not (isinstance(text_info, (tuple, list)) and len(text_info) == 2):
-                        continue
-                        
-                    text, score = text_info
-                    normalized_text = self.normalize_text(str(text))
-                    
-                    if normalized_text:
-                        results.append((normalized_text, float(score)))
-                
-                logger.info(f"{strategy_name}: extracted {len(results)} texts")
-                return results
-            
-        except Exception as e:
-            logger.error(f"Error processing {strategy_name}: {e}")
-            return []
-        
-        return []
-    
-    def merge_ocr_results(self, results_list: List[List[Tuple[str, float]]]) -> List[Tuple[str, float]]:
-        text_scores = {}
-        
-        for results in results_list:
-            for text, score in results:
-                normalized = self.normalize_text(text)
-                if normalized:
-                    if normalized not in text_scores or score > text_scores[normalized]:
-                        text_scores[normalized] = score
-        
-        return sorted(text_scores.items(), key=lambda x: x[1], reverse=True)
-    
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        client = getattr(self, "_client", None)
+        if client:
+            with contextlib.suppress(Exception):
+                client.close()
+
     def process_image(self, image_np: np.ndarray) -> List[Tuple[str, float]]:
-        if len(image_np.shape) == 2:
-            image_np = cv2.cvtColor(image_np, cv2.COLOR_GRAY2RGB)
-        elif image_np.shape[2] == 4:
-            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
-        
-        strategies = [
-            ('original', lambda img: self.pad_to_multiple(img if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2RGB), 32)),
-            ('enhanced', lambda img: self.preprocess_image(img)),
-            ('handwriting', lambda img: self.pad_to_multiple(self.enhance_for_handwriting(img), 32))
-        ]
-        
-        all_results = []
-        for name, preprocess_func in strategies:
+        """Process an RGB/greyscale numpy array and return text fragments with dummy confidence."""
+        if image_np is None or image_np.size == 0:
+            return []
+
+        pil_image = self._prepare_pil_image(image_np)
+        natural_text = self._run_with_retries(pil_image)
+        if not natural_text:
+            return []
+
+        lines = [line.strip() for line in natural_text.splitlines() if line.strip()]
+        return [(line, 1.0) for line in lines] or [(natural_text.strip(), 1.0)]
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _prepare_pil_image(self, image_np: np.ndarray) -> Image.Image:
+        clipped = np.clip(image_np, 0, 255).astype(np.uint8)
+
+        if clipped.ndim == 2:
+            clipped = np.stack([clipped] * 3, axis=-1)
+        elif clipped.shape[2] == 4:
+            clipped = clipped[:, :, :3]
+
+        image = Image.fromarray(clipped, mode="RGB")
+        image = ImageOps.exif_transpose(image)
+        longest_dim = max(image.width, image.height)
+        if longest_dim > self.target_longest_image_dim:
+            scale = self.target_longest_image_dim / float(longest_dim)
+            new_size = (max(1, int(round(image.width * scale))), max(1, int(round(image.height * scale))))
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        return image
+
+    def _run_with_retries(self, base_image: Image.Image) -> str:
+        rotation = 0
+        attempt = 0
+
+        while attempt < self.max_retries:
+            rotated = self._apply_rotation(base_image, rotation)
+            payload = self._build_payload(rotated, attempt)
             try:
-                processed = preprocess_func(image_np)
-                if processed is not None and processed.size > 0:
-                    results = self.safe_ocr_process(processed, name)
-                    if results:
-                        all_results.append(results)
-            except Exception as e:
-                logger.error(f"Error in {name} preprocessing: {e}")
-        
-        merged = self.merge_ocr_results(all_results)
-        filtered = [(text, score) for text, score in merged if score >= 0.3]
-        
-        logger.info(f"OCR completed: {len(filtered)} unique items")
-        return filtered
+                response = self._dispatch(payload)
+                page_response = self._parse_page_response(response)
+            except TemporaryOcrError as exc:
+                backoff = min(30, 2 ** attempt)
+                logger.warning("Temporary olmOCR error (%s). Retrying in %ss.", exc, backoff)
+                time.sleep(backoff)
+                attempt += 1
+                continue
+            except Exception as exc:
+                logger.error("olmOCR request failed permanently: %s", exc)
+                break
+
+            if not page_response.is_rotation_valid and attempt < self.max_retries - 1:
+                rotation = (rotation + page_response.rotation_correction) % 360
+                logger.info("olmOCR suggested rotation correction -> %s degrees", page_response.rotation_correction)
+                attempt += 1
+                continue
+
+            return page_response.natural_text or ""
+
+        logger.error("olmOCR failed after %s attempts", self.max_retries)
+        return ""
+
+    def _apply_rotation(self, image: Image.Image, rotation: int) -> Image.Image:
+        if rotation not in {0, 90, 180, 270}:
+            return image
+        if rotation == 0:
+            return image
+
+        transpose_map = {
+            90: Image.Transpose.ROTATE_90,
+            180: Image.Transpose.ROTATE_180,
+            270: Image.Transpose.ROTATE_270,
+        }
+        return image.transpose(transpose_map[rotation])
+
+    def _build_payload(self, image: Image.Image, attempt: int) -> dict:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        temperature = self.temperature_schedule[min(attempt, len(self.temperature_schedule) - 1)]
+        return {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": self._prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded_image}"}},
+                    ],
+                }
+            ],
+            "max_tokens": self.max_tokens,
+            "temperature": temperature,
+            "priority": self.max_retries - attempt,
+        }
+
+    def _dispatch(self, payload: dict) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        url = f"{self.server_url}/chat/completions"
+        with ocr_lock:
+            response = self._client.post(url, headers=headers, json=payload)
+
+        if response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+            raise TemporaryOcrError(f"{response.status_code} {response.text}")
+
+        response.raise_for_status()
+        return response.json()
+
+    def _parse_page_response(self, response_json: dict) -> PageResponse:
+        if "choices" not in response_json or not response_json["choices"]:
+            raise ValueError("olmOCR response missing choices")
+
+        choice = response_json["choices"][0]
+        if choice.get("finish_reason") != "stop":
+            raise TemporaryOcrError(f"finish_reason={choice.get('finish_reason')}")
+
+        content = choice["message"]["content"]
+        if isinstance(content, list):  # OpenAI vision models may return a list
+            content = "".join(item.get("text", "") for item in content)
+
+        front_matter, text = self._parser._extract_front_matter_and_text(content)
+
+        return self._parser._parse_front_matter(front_matter, text)

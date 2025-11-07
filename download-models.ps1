@@ -1,84 +1,25 @@
-# Download and extract PaddleOCR models for Windows
+[CmdletBinding()]
 param(
-    [string]$OutputPath = ".\models\paddleocr"
+    [string]$EnvFile = ".\.env"
 )
 
-# Create directory structure
-$dirs = @(
-    "$OutputPath\whl\det\en\en_PP-OCRv3_det_infer",
-    "$OutputPath\whl\rec\en\en_PP-OCRv3_rec_infer",
-    "$OutputPath\whl\cls\ch_ppocr_mobile_v2.0_cls_infer"
-)
+Write-Host "olmOCR does not ship light-weight local models that can be downloaded ahead of time." -ForegroundColor Yellow
+Write-Host "Instead, point the pipeline at a running olmOCR endpoint (DeepInfra, Parasail, Cirrascale, or your own vLLM deployment)." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "To run quantized OCR locally, launch 'scripts/start_local_olmocr.ps1' which uses vLLM with the FP8 checkpoint." -ForegroundColor Yellow
 
-foreach ($dir in $dirs) {
-    New-Item -Path $dir -ItemType Directory -Force
-    Write-Host "Created directory: $dir"
+if (-Not (Test-Path $EnvFile)) {
+    Write-Warning "No .env file was found at $EnvFile. Create one with OLMOCR_SERVER_URL, OLMOCR_MODEL, and OLMOCR_API_KEY."
+    return
 }
 
-# Model URLs and extraction paths
-$models = @(
-    @{
-        url = "https://paddleocr.bj.bcebos.com/PP-OCRv3/english/en_PP-OCRv3_det_infer.tar"
-        file = "en_PP-OCRv3_det_infer.tar"
-        dest = "$OutputPath\whl\det\en\en_PP-OCRv3_det_infer"
-    },
-    @{
-        url = "https://paddleocr.bj.bcebos.com/PP-OCRv3/english/en_PP-OCRv3_rec_infer.tar"
-        file = "en_PP-OCRv3_rec_infer.tar"
-        dest = "$OutputPath\whl\rec\en\en_PP-OCRv3_rec_infer"
-    },
-    @{
-        url = "https://paddleocr.bj.bcebos.com/dygraph_v2.0/ch/ch_ppocr_mobile_v2.0_cls_infer.tar"
-        file = "ch_ppocr_mobile_v2.0_cls_infer.tar"
-        dest = "$OutputPath\whl\cls\ch_ppocr_mobile_v2.0_cls_infer"
-    }
-)
-
-# Download models
-foreach ($model in $models) {
-    Write-Host "Downloading $($model.file)..."
-    try {
-        Invoke-WebRequest -Uri $model.url -OutFile $model.file -ErrorAction Stop
-        $fileSize = (Get-Item $model.file).Length
-        Write-Host "Downloaded $($model.file) ($fileSize bytes)"
-    }
-    catch {
-        Write-Error "Failed to download $($model.file): $_"
-        continue
-    }
+$envContent = Get-Content $EnvFile | Where-Object { $_ -match '^(OLMOCR_SERVER_URL|OLMOCR_MODEL|OLMOCR_API_KEY)=' }
+if ($envContent.Count -eq 0) {
+    Write-Warning "The .env file does not define OLMOCR_* variables yet."
+} else {
+    Write-Host "Current olmOCR configuration extracted from $EnvFile:`n" -ForegroundColor Cyan
+    $envContent | ForEach-Object { Write-Host "  $_" }
 }
 
-# Try Windows tar first
-foreach ($model in $models) {
-    if (Test-Path $model.file) {
-        Write-Host "Extracting $($model.file) with Windows tar..."
-        try {
-            tar -xf $model.file -C $model.dest
-            Write-Host "Successfully extracted $($model.file)"
-        }
-        catch {
-            Write-Warning "Windows tar failed for $($model.file), trying alternative..."
-            
-            # Try PowerShell expansion
-            try {
-                Add-Type -AssemblyName System.IO.Compression.FileSystem
-                [System.IO.Compression.ZipFile]::ExtractToDirectory($model.file, $model.dest)
-                Write-Host "Successfully extracted $($model.file) with .NET"
-            }
-            catch {
-                Write-Error "All extraction methods failed for $($model.file)"
-            }
-        }
-    }
-}
-
-# Cleanup tar files
-foreach ($model in $models) {
-    if (Test-Path $model.file) {
-        Remove-Item $model.file
-        Write-Host "Cleaned up $($model.file)"
-    }
-}
-
-Write-Host "Model download and extraction complete!"
-Write-Host "Models stored in: $OutputPath"
+Write-Host "`nSet OLMOCR_SERVER_URL to an OpenAI-compatible endpoint (e.g. https://api.deepinfra.com/v1/openai)," `
+    + " OLMOCR_MODEL to allenai/olmOCR-2-7B-1025-FP8 (or your hosted variant), and provide OLMOCR_API_KEY when the provider requires it." -ForegroundColor Green
